@@ -14,6 +14,9 @@ from PyQt5.QtWidgets import QLabel, QGraphicsScene, QGraphicsView, QGraphicsItem
 from PyQt5.QtWidgets import QMainWindow, QGraphicsLineItem
 
 
+from qt_objects import Circle, GraphicScene
+
+
 CIRCLE_DIAMETER = 30
 PAINTABLE_AREA_HEIGHT = 500
 PAINTABLE_AREA_WIDTH = 500
@@ -31,26 +34,29 @@ class App():
     def __init__(self):
         self.qapp = QApplication(sys.argv)
 
-        self.m = MyGraphicScene()
+        self.m = GraphicScene(PAINTABLE_AREA_WIDTH+PAINTABLE_AREA_PADDING_SIZE,
+                              PAINTABLE_AREA_HEIGHT+PAINTABLE_AREA_PADDING_SIZE)
 
         master_node = MasterNode(Pos(x=PAINTABLE_AREA_WIDTH / 2,
                                      y=PAINTABLE_AREA_HEIGHT / 2),
                                       CIRCLE_DIAMETER,
                                       None, None, QColor('red'))
 
-        self.audio_controller = AudioController(master_node)
-
+        self.node_pool = NodePool()
         self.m.addItem(master_node.get_qgraphics_item())
+        self.node_pool.register_node(master_node)
 
         self.pulse = pulsectl.Pulse('volume-controller')
         for sink_input in self.pulse.sink_input_list():
-            pos = Pos(x=100, y=100)
             input_node = InputNode(Pos(x=100, y=100),
                                    CIRCLE_DIAMETER,
                                    self.pulse, sink_input)
 
-            self.audio_controller.register_input_node(input_node)
+            self.node_pool.register_node(input_node)
             self.m.addItem(input_node.get_qgraphics_item())
+
+        self.audio_controller = AudioController(master_node,
+                                                self.node_pool)
 
     def run(self):
         th = Thread(target=self.audio_controller.run)
@@ -62,21 +68,11 @@ class App():
         self.pulse.close()
 
 class AudioController():
-    def __init__(self, master_node):
-        self.notifier = StateNotifier()
+    def __init__(self, master_node, node_pool):
+        self.node_pool = node_pool
+        self.notifier = StateNotifier(node_pool)
 
         self.master_node = master_node
-        self.notifier.register_node(master_node)
-        
-        self.input_nodes = dict()
-
-    def register_input_node(self, input_node):
-        self.input_nodes[input_node.get_index()] = input_node
-        self.notifier.register_node(input_node)
-
-    def unregister_input_node(self, input_node):
-        del self.input_nodes[input_node.get_index()]
-        self.notifier.unregister_node(input_node)
 
     def change_volume_by_distance(self, master_node, input_node):
         distance = calculate_distance(master_node.get_pos(),
@@ -96,16 +92,16 @@ class AudioController():
     def run(self):
         for node in self.notifier.run():
             if isinstance(node, MasterNode):
-                input_nodes = self.input_nodes.values()
+                input_nodes = list(filter(lambda x: isinstance(x, InputNode),
+                                          self.node_pool.get_nodes()))
 
             else:
                 input_nodes = [node]
 
             for input_node in input_nodes:
-                is_suceed = self.change_volume_by_distance(self.master_node,
-                                                           input_node)
-                if not is_suceed:
-                    self.unregister_input_node(input_node)
+                _ = self.change_volume_by_distance(self.master_node,
+                                                   input_node)
+                    
 
 class Pos(namedtuple('Pos', ['x', 'y'])):
     pass
@@ -121,13 +117,30 @@ class Node():
         self.sink_input = sink_input
         self.pulse = pulse
 
+        qpos = self.qgraphics_item.pos()
+        self.prev_pos = Pos(qpos.x() + self.diameter / 2,
+                            qpos.y() + self.diameter / 2)
+
     def get_id(self):
         pass
 
+    # Don't Update Pos
     def get_pos(self):
+        return self._get_current_pos_from_current_qpos()
+
+    # Don't Update Pos
+    def _get_current_pos_from_current_qpos(self):
         qpos = self.qgraphics_item.pos()
         return Pos(qpos.x() + self.diameter / 2,
                    qpos.y() + self.diameter / 2)
+
+    def is_moved(self):
+        curr_pos = self._get_current_pos_from_current_qpos()
+        result = not((curr_pos.x == self.prev_pos.x) and \
+            (curr_pos.y == self.prev_pos.y))
+        self.prev_pos = curr_pos
+
+        return result
 
     def get_qgraphics_item(self):
         return self.qgraphics_item
@@ -141,7 +154,7 @@ class InputNode(Node):
         volume = self.sink_input.volume
         volume.value_flat = value
         try:
-            self.pulse.sink_input_volume_set(self.get_index(),
+            self.pulse.sink_input_volume_set(self.get_id(),
                                              volume)
             return True
 
@@ -154,9 +167,6 @@ class InputNode(Node):
     def get_id(self):
         return self.sink_input.index
 
-    def get_index(self):
-        return self.sink_input.index
-
 
 class MasterNode(Node):
     def __init__(self, *args, **kwargs):
@@ -165,93 +175,31 @@ class MasterNode(Node):
     def get_id(self):
         return -1
 
-class Circle(QGraphicsItem):
-    def __init__(self, x, y, diameter, color=None):
-        super().__init__()
-        self.x = x
-        self.y = y
-        self.diameter = diameter
-        self.setPos(self.x, self.y)
-
-        if color is not None:
-            self.color = color
-        else:
-            self.color = QColor('blue')
-
-        self.prev_x = self.x
-        
-        self.setAcceptDrops(True)
-        self.setCursor(Qt.OpenHandCursor)
-        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.ItemIsMovable, True)
-        self.setFlag(QGraphicsItem.ItemIsFocusable, True)
-        self.setAcceptHoverEvents(True)
-
-    def setColor(self, color):
-        self.color = QColor(color)
-
-    def boundingRect(self):
-        return QRectF(-self.diameter / 2.0, -self.diameter / 2.0, self.diameter, self.diameter)
-
-    def paint(self, painter, options, widget):
-        painter.setPen(QPen(QColor('black')))
-        painter.setBrush(self.color)
-        painter.drawEllipse(QRectF(-self.diameter / 2.0, -self.diameter / 2.0, self.diameter, self.diameter))
-
-
-class MyGraphicScene(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.rect=QRectF(0, 0,
-                         PAINTABLE_AREA_WIDTH+PAINTABLE_AREA_PADDING_SIZE,
-                         PAINTABLE_AREA_HEIGHT+PAINTABLE_AREA_PADDING_SIZE)
-
-        self.Scene=QGraphicsScene(self.rect)
-        self.View=QGraphicsView()
-        self.View.setCacheMode(QGraphicsView.CacheNone)
-
-        self.initScene()
-        self.displayUI()
-
-    def initScene(self):
-        self.Scene.setBackgroundBrush(QBrush(QColor('yellow'),Qt.SolidPattern))
-        self.View.setScene(self.Scene)
-
-    def addItem(self, item):
-        self.Scene.addItem(item)
-        self.View.setScene(self.Scene)
-
-    def removeItem(self, item):
-        self.Scene.removeItem(item)
-        self.View.setScene(self.Scene)
-
-    def displayUI(self):
-        print('Is scene active', self.Scene.isActive())
-        self.setCentralWidget(self.View)
-        self.resize(PAINTABLE_AREA_WIDTH, PAINTABLE_AREA_HEIGHT)
-        self.show()
-
 
 class StateNotifier():
+    def __init__(self, node_pool):
+        self.node_pool = node_pool
+
+    def run(self):
+        while True:
+            for node in self.node_pool.get_nodes():
+                if node.is_moved():
+                    yield node
+            time.sleep(SEC_PER_NOTIFICATION)
+
+
+class NodePool():
     def __init__(self):
         self.nodes = dict()
-        self.prev_poses = dict()
 
     def register_node(self, node):
         self.nodes[node.get_id()] = node
-        self.prev_poses[node.get_id()] = node.get_pos()
 
     def unregister_node(self, node):
         del self.nodes[node.get_id()]
 
-    def run(self):
-        while True:
-            for node, prev_pos in zip(self.nodes.values(), self.prev_poses.values()):
-                pos = node.get_pos()
-                if prev_pos != pos:
-                    self.prev_poses[node.get_id()] = pos
-                    yield node
-            time.sleep(SEC_PER_NOTIFICATION)
+    def get_nodes(self):
+        return self.nodes.values()
 
 
 def main():
